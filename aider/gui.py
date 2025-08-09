@@ -11,19 +11,24 @@ from aider.coders import Coder
 from aider.dump import dump  # noqa: F401
 from aider.io import InputOutput
 from aider.main import main as cli_main
-from aider.scrape import Scraper
+from aider.scrape import Scraper, has_playwright
 
 
 class CaptureIO(InputOutput):
     lines = []
 
-    def tool_output(self, msg):
-        self.lines.append(msg)
-        super().tool_output(msg)
+    def tool_output(self, msg, log_only=False):
+        if not log_only:
+            self.lines.append(msg)
+        super().tool_output(msg, log_only=log_only)
 
     def tool_error(self, msg):
         self.lines.append(msg)
         super().tool_error(msg)
+
+    def tool_warning(self, msg):
+        self.lines.append(msg)
+        super().tool_warning(msg)
 
     def get_captured_lines(self):
         lines = self.lines
@@ -155,7 +160,7 @@ class GUI:
 
             st.warning(
                 "This browser version of aider is experimental. Please share feedback in [GitHub"
-                " issues](https://github.com/paul-gauthier/aider/issues)."
+                " issues](https://github.com/Aider-AI/aider/issues)."
             )
 
     def do_settings_tab(self):
@@ -479,11 +484,7 @@ class GUI:
         url = self.web_content
 
         if not self.state.scraper:
-            self.scraper = Scraper(print_error=self.info)
-
-        instructions = self.scraper.get_playwright_instructions()
-        if instructions:
-            self.info(instructions)
+            self.scraper = Scraper(print_error=self.info, playwright_available=has_playwright())
 
         content = self.scraper.scrape(url) or ""
         if content.strip():
@@ -527,7 +528,7 @@ def gui_main():
         page_icon=urls.favicon,
         menu_items={
             "Get Help": urls.website,
-            "Report a bug": "https://github.com/paul-gauthier/aider/issues",
+            "Report a bug": "https://github.com/Aider-AI/aider/issues",
             "About": "# Aider\nAI pair programming in your browser.",
         },
     )

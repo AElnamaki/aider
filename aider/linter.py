@@ -1,7 +1,5 @@
-import io
 import os
 import re
-import runpy
 import subprocess
 import sys
 import traceback
@@ -9,10 +7,12 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
+import oslex
 from grep_ast import TreeContext, filename_to_lang
-from tree_sitter_languages import get_parser  # noqa: E402
+from grep_ast.tsl import get_parser  # noqa: E402
 
 from aider.dump import dump  # noqa: F401
+from aider.run_cmd import run_cmd_subprocess  # noqa: F401
 
 # tree_sitter is throwing a FutureWarning
 warnings.simplefilter("ignore", category=FutureWarning)
@@ -37,23 +37,31 @@ class Linter:
 
     def get_rel_fname(self, fname):
         if self.root:
-            return os.path.relpath(fname, self.root)
+            try:
+                return os.path.relpath(fname, self.root)
+            except ValueError:
+                return fname
         else:
             return fname
 
     def run_cmd(self, cmd, rel_fname, code):
-        cmd += " " + rel_fname
-        cmd = cmd.split()
+        cmd += " " + oslex.quote(rel_fname)
 
-        process = subprocess.Popen(
-            cmd, cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-        )
-        stdout, _ = process.communicate()
-        errors = stdout.decode()
-        if process.returncode == 0:
+        returncode = 0
+        stdout = ""
+        try:
+            returncode, stdout = run_cmd_subprocess(
+                cmd,
+                cwd=self.root,
+                encoding=self.encoding,
+            )
+        except OSError as err:
+            print(f"Unable to execute lint command: {err}")
+            return
+        errors = stdout
+        if returncode == 0:
             return  # zero exit status
 
-        cmd = " ".join(cmd)
         res = f"## Running: {cmd}\n\n"
         res += errors
 
@@ -73,7 +81,11 @@ class Linter:
 
     def lint(self, fname, cmd=None):
         rel_fname = self.get_rel_fname(fname)
-        code = Path(fname).read_text(self.encoding)
+        try:
+            code = Path(fname).read_text(encoding=self.encoding, errors="replace")
+        except OSError as err:
+            print(f"Unable to read {fname}: {err}")
+            return
 
         if cmd:
             cmd = cmd.strip()
@@ -87,19 +99,19 @@ class Linter:
                 cmd = self.languages.get(lang)
 
         if callable(cmd):
-            linkres = cmd(fname, rel_fname, code)
+            lintres = cmd(fname, rel_fname, code)
         elif cmd:
-            linkres = self.run_cmd(cmd, rel_fname, code)
+            lintres = self.run_cmd(cmd, rel_fname, code)
         else:
-            linkres = basic_lint(rel_fname, code)
+            lintres = basic_lint(rel_fname, code)
 
-        if not linkres:
+        if not lintres:
             return
 
         res = "# Fix any errors below, if possible.\n\n"
-        res += linkres.text
+        res += lintres.text
         res += "\n"
-        res += tree_context(rel_fname, code, linkres.lines)
+        res += tree_context(rel_fname, code, lintres.lines)
 
         return res
 
@@ -123,30 +135,31 @@ class Linter:
 
     def flake8_lint(self, rel_fname):
         fatal = "E9,F821,F823,F831,F406,F407,F701,F702,F704,F706"
-        flake8 = f"flake8 --select={fatal} --show-source --isolated"
+        flake8_cmd = [
+            sys.executable,
+            "-m",
+            "flake8",
+            f"--select={fatal}",
+            "--show-source",
+            "--isolated",
+            rel_fname,
+        ]
 
-        original_argv = sys.argv
-        original_stdout = sys.stdout
-
-        sys.argv = flake8.split() + [rel_fname]
-        sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
-
-        text = f"## Running: {' '.join(sys.argv)}\n\n"
+        text = f"## Running: {' '.join(flake8_cmd)}\n\n"
 
         try:
-            runpy.run_module("flake8", run_name="__main__")
-        except SystemExit as e:
-            if e.code == 0:
-                errors = None
-            else:
-                sys.stdout.seek(0)
-                errors = sys.stdout.read()
-
-            sys.stdout = original_stdout
-            sys.argv = original_argv
-        finally:
-            sys.stdout = original_stdout
-            sys.argv = original_argv
+            result = subprocess.run(
+                flake8_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                encoding=self.encoding,
+                errors="replace",
+                cwd=self.root,
+            )
+            errors = result.stdout + result.stderr
+        except Exception as e:
+            errors = f"Error running flake8: {str(e)}"
 
         if not errors:
             return
@@ -194,10 +207,24 @@ def basic_lint(fname, code):
     if not lang:
         return
 
-    parser = get_parser(lang)
+    # Tree-sitter linter is not capable of working with typescript #1132
+    if lang == "typescript":
+        return
+
+    try:
+        parser = get_parser(lang)
+    except Exception as err:
+        print(f"Unable to load parser: {err}")
+        return
+
     tree = parser.parse(bytes(code, "utf-8"))
 
-    errors = traverse_tree(tree.root_node)
+    try:
+        errors = traverse_tree(tree.root_node)
+    except RecursionError:
+        print(f"Unable to lint {fname} due to RecursionError")
+        return
+
     if not errors:
         return
 
